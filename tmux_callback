@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Run a shell command, then type a message and Enter into a tmux pane.
+
+Examples (run from the agent's tmux environment):
+  tmux_callback -c 'sleep 3600' -m '任务已结束，请检查结果。'
+  tmux_callback -t work:0.0 -c 'python train.py' -m '请检查训练日志。'
+
+Runs in the background by default; use --foreground to wait in the terminal.
+The default log is tmux-callback.log beside this script. Override with --log.
+Background command output and callback errors also go to that log.
+Wake-up attempts and results always append timestamped JSON records to --log,
+including in foreground mode. A sent record means text and Enter were sent.
+The command runs in the caller's working directory with its environment, using
+/bin/sh. Use e.g. -c 'bash train.sh' if Bash is needed. Keep the command in the
+foreground (no trailing &), so its exit really means the work has finished.
+Only single-line messages are accepted. The target must still be running the
+agent and ready for input when the command exits. Delivery is not acknowledgement
+that the agent resumed. Closing tmux's server or rebooting interrupts this setup.
+"""
+
+import argparse
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+
+def tmux(socket, *args):
+    prefix = ["tmux", "-S", socket] if socket else ["tmux"]
+    result = subprocess.run(
+        prefix + list(args), capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "tmux command failed")
+    return result.stdout.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-c", "--command", required=True, help="shell command to wait for")
+    parser.add_argument("-m", "--message", required=True, help="literal wake-up message")
+    parser.add_argument("-t", "--target", default=os.environ.get("TMUX_PANE"),
+                        help="tmux pane; defaults to $TMUX_PANE")
+    parser.add_argument("--socket", help="tmux socket path; defaults to $TMUX's server")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--foreground", action="store_true", help="run in foreground instead of detaching")
+    mode.add_argument("--background", action="store_false", dest="foreground",
+                      help="run in background (default)")
+    parser.set_defaults(foreground=False)
+    parser.add_argument("--log", default=str(Path(__file__).resolve().with_name("tmux-callback.log")),
+                        help="wake-up log (default: tmux-callback.log beside this script)")
+    args = parser.parse_args()
+    if not args.target:
+        parser.error("not inside tmux: supply --target (and --socket for a custom server)")
+    if not args.command.strip():
+        parser.error("command must not be empty")
+    if not args.message.strip() or any(ord(c) < 32 or ord(c) == 127 for c in args.message):
+        parser.error("message must be nonempty, single-line text without control characters")
+
+    socket = args.socket
+    if socket is None and os.environ.get("TMUX"):
+        socket = os.environ["TMUX"].rsplit(",", 2)[0]
+    # Resolve once: changing window indices or the active pane must not redirect input.
+    resolved = tmux(socket, "display-message", "-p", "-t", args.target,
+                    "#{socket_path}\t#{pane_id}\t#{pane_dead}")
+    socket, pane, dead = resolved.split("\t")
+    if not re.fullmatch(r"%\d+", pane) or dead != "0":
+        raise RuntimeError("target pane is not alive")
+
+    log = Path(args.log).expanduser().resolve()
+    if not args.foreground:
+        worker_args = [sys.executable, str(Path(__file__).resolve()),
+                       "--foreground",
+                       "--socket=" + socket, "--target=" + pane,
+                       "--command=" + args.command, "--message=" + args.message,
+                       "--log=" + str(log)]
+        with log.open("ab", buffering=0) as output:
+            worker = subprocess.Popen(
+                worker_args, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                start_new_session=True,
+            )
+        print(f"Started callback PID={worker.pid}, pane={pane}, log={log}")
+        return 0
+
+    # Open before starting work, so an unwritable log fails early.
+    with log.open("a", encoding="utf-8") as audit:
+        def record(event, **details):
+            entry = dict(time=datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                         event=event, pid=os.getpid(), socket=socket, pane=pane,
+                         message=args.message, **details)
+            audit.write("\n" + json.dumps(entry, ensure_ascii=False) + "\n")
+            audit.flush()
+
+        print(f"Running command; callback target={pane}", flush=True)
+        result = subprocess.run(args.command, shell=True, executable="/bin/sh",
+                                stdin=subprocess.DEVNULL)
+        print(f"Command exited: {result.returncode}", flush=True)
+        record("wake_attempt", command_exit_code=result.returncode)
+        try:
+            # Text is never interpreted as tmux key names or shell syntax.
+            if tmux(socket, "display-message", "-p", "-t", pane, "#{pane_dead}") != "0":
+                raise RuntimeError("target pane has exited; callback was not sent")
+            tmux(socket, "send-keys", "-t", pane, "-l", "--", args.message)
+            # Give interactive TUIs time to consume text before submitting it.
+            time.sleep(0.5)
+            tmux(socket, "send-keys", "-t", pane, "Enter")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            record("wake_failed", command_exit_code=result.returncode, error=str(exc))
+            raise
+        record("wake_sent", command_exit_code=result.returncode)
+    print("Callback text and Enter sent.", flush=True)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"tmux-callback: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
