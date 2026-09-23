@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 
 def tmux(socket, *args):
@@ -37,6 +38,19 @@ def tmux(socket, *args):
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "tmux command failed")
     return result.stdout.strip()
+
+
+def paste_message(socket, pane, message):
+    # Explicit paste boundaries keep Codex's burst detector from consuming the
+    # subsequent Enter as a newline, even if the TUI processes input late.
+    # A private named buffer avoids replacing the user's existing paste buffer.
+    buffer = "tmux-callback-" + uuid.uuid4().hex
+    tmux(socket, "set-buffer", "-b", buffer, "--", message)
+    try:
+        # tmux adds brackets only when the target application enables them.
+        tmux(socket, "paste-buffer", "-p", "-b", buffer, "-t", pane)
+    finally:
+        tmux(socket, "delete-buffer", "-b", buffer)
 
 
 def main():
@@ -106,7 +120,7 @@ def main():
             # Text is never interpreted as tmux key names or shell syntax.
             if tmux(socket, "display-message", "-p", "-t", pane, "#{pane_dead}") != "0":
                 raise RuntimeError("target pane has exited; callback was not sent")
-            tmux(socket, "send-keys", "-t", pane, "-l", "--", args.message)
+            paste_message(socket, pane, args.message)
             # Give interactive TUIs time to consume text before submitting it.
             time.sleep(0.5)
             tmux(socket, "send-keys", "-t", pane, "Enter")

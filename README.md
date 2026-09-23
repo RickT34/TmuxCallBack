@@ -32,3 +32,9 @@
 ## 注意
 
 保持目标 pane 中的 Agent 等待输入；消息必须为单行文本。脚本只负责发送文本和 Enter，不判断 Agent 是否已恢复，也不判断任务是否成功。关闭 tmux 服务器或重启机器后，不能保证任务与唤醒继续执行。
+
+### 文本出现了，但 Enter 变成换行？
+
+Codex 的快速粘贴检测可能把文本和随后的 Enter 归为同一次粘贴。脚本使用 `tmux paste-buffer -p` 发送带边界的粘贴，再单独发送 Enter，避免仅靠等待时间区分粘贴和提交。目标程序未启用带边界粘贴时，tmux 会退回普通粘贴。
+
+如果旧版 Codex 或终端环境仍遇到此问题，可以尝试用 `codex -c disable_paste_burst=true` 启动 Codex，关闭快速粘贴检测（这也会影响未带边界的手动粘贴）。该配置见 [Codex 配置参考](https://developers.openai.com/codex/config-reference/#disable_paste_burst)。
